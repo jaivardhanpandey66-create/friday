@@ -136,8 +136,8 @@ class Voice:
         self.wake = "attentive"
         self._state()
         log("wake word heard")
-        self._say("Yes?")
-        # brief beep through UI? keep it audio-light: small spotlight tone
+        # No spoken "Yes?" — it gets picked up by the mic and breaks dictation.
+        # The UI shows ATTENTIVE instantly as the acknowledgment.
         self._open_mic()  # fresher stream for dictation
         cmd = self._capture_command()
         self.wake = "listening"
@@ -150,13 +150,17 @@ class Voice:
                     SERVER + "/api/ingest", data=data,
                     headers={"Content-Type": "application/json"}, method="POST")
                 urllib.request.urlopen(req, timeout=2).read()
-            except Exception:
-                pass
+            except Exception as e:
+                log("ingest failed: %s" % e)
         else:
             log("no command captured")
 
     def _capture_command(self):
-        """Dictate up to MAX_CMD_SECONDS, stopping on a silence gap."""
+        """Dictate up to MAX_CMD_SECONDS, stopping on a silence gap.
+        Saves the raw audio to LAST_CAPTURE for forensics."""
+        logs_dir = os.path.expanduser("~/.local/share/friday")
+        os.makedirs(logs_dir, exist_ok=True)
+        tee = open(os.path.join(logs_dir, "last_capture.raw"), "wb")
         self.cmd_rec = self.vosk.KaldiRecognizer(self.model, 16000)
         words = []
         last_speech = None
@@ -169,6 +173,7 @@ class Voice:
             if not raw:
                 time.sleep(0.05)
                 continue
+            tee.write(raw)
             if self.cmd_rec.AcceptWaveform(raw):
                 res = json.loads(self.cmd_rec.Result())
                 t = res.get("text", "").strip()
@@ -176,13 +181,22 @@ class Voice:
                     words.append(t)
                     last_speech = time.time()
             else:
-                partial = json.loads(self.cmd_rec.PartialResult()).get("partial", "")
-                if partial:
+                if self.cmd_rec.PartialResult() and \
+                   json.loads(self.cmd_rec.PartialResult()).get("partial", ""):
                     last_speech = time.time()
             if last_speech is not None and \
                time.time() - last_speech > SILENCE_SECONDS:
                 break
-        return " ".join(words)
+        tee.close()
+        text = " ".join(words)
+        if not text:
+            try:
+                text = json.loads(self.cmd_rec.FinalResult()).get("text", "").strip()
+            except Exception:
+                pass
+        log("capture: %r (len=%d)" % (text, os.path.getsize(
+            os.path.join(logs_dir, "last_capture.raw"))))
+        return text
 
 
 def shutil_have(cmd):

@@ -29,12 +29,13 @@ import argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.environ.get("CHIP_CONFIG_DIR", os.path.expanduser("~/.config/chip"))
-MODEL = "openai/gpt-4o-mini"
+MODEL = "google/gemini-3.5-flash-lite"
 BASE_URL = "https://openrouter.ai/api/v1"
 PORT = 8300
 CONTEXT_BUDGET = 32000
 TEMPERATURE = 0.6
 MAX_STEPS = 8
+MAX_TOKENS = 1024   # hard cap on output — fits low-balance/academic accounts
 HOME = os.path.expanduser("~")
 DATA_DIR = os.path.expanduser("~/.local/share/friday")
 DESTRUCTIVE_CMDS = re.compile(
@@ -565,7 +566,8 @@ def agent_generate(client, messages, max_steps=None, temperature=None, model=Non
         try:
             stream = client.chat.completions.create(
                 model=model, messages=messages, tools=TOOLS,
-                tool_choice="auto", temperature=temperature, stream=True)
+                tool_choice="auto", temperature=temperature, stream=True,
+                max_tokens=MAX_TOKENS)
         except Exception as e:
             yield {"type": "error", "error": str(e)}
             return
@@ -726,14 +728,29 @@ def dictate(seconds=6.0, silence_gap=1.5):
                     pass
 
 
+_TTS_ENGINE = {"e": None}
+
+
+def _warm_tts():
+    """Build the pyttsx3 engine once at boot so first /api/say is instant."""
+    try:
+        import pyttsx3
+        _TTS_ENGINE["e"] = pyttsx3.init()
+    except Exception:
+        _TTS_ENGINE["e"] = None
+
+
 def _tts(text):
     if not text:
         return
     with _TTS_LOCK:
         try:
-            import pyttsx3
-            engine = pyttsx3.init()
-            engine.setProperty("rate", 165)
+            engine = _TTS_ENGINE["e"]
+            if engine is None:
+                import pyttsx3
+                engine = pyttsx3.init()
+                _TTS_ENGINE["e"] = engine
+            engine.setProperty("rate", 170)
             for v in engine.getProperty("voices") or []:
                 if "female" in str(v.name).lower() or "f4" in str(v.id).lower():
                     engine.setProperty("voice", v.id)
@@ -865,7 +882,9 @@ class Handler(BaseHTTPRequestHandler):
         message = str(b.get("message") or "").strip()
         session = str(b.get("session") or "default")[:80]
         mode = str(b.get("mode") or "build")
-        stream = bool(b.get("stream"))
+        stream = bool(b.get("stream")) or bool(
+            parse_qs(urlparse(self.path).query).get("stream"))
+        model = str(b.get("model") or "").strip() or None
         if not message:
             return self._json({"error": "message required"}, 400)
         try:
@@ -881,7 +900,7 @@ class Handler(BaseHTTPRequestHandler):
         recall_note = "" if session.startswith("noauto") else _mem_recall(message)
         gen_msgs = msgs + ([{"role": "system", "content": recall_note}]
                            if recall_note else [])
-        events = agent_generate(client, gen_msgs)
+        events = agent_generate(client, gen_msgs, model=model)
 
         if not stream:
             steps, answer, err = [], "", None
@@ -935,6 +954,7 @@ def main():
     if not get_api_key():
         print("FRIDAY: no API key found (set OPENROUTER_API_KEY or ~/.config/chip/key).")
         sys.exit(1)
+    threading.Thread(target=_warm_tts, daemon=True).start()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print("FRIDAY online on http://%s:%d  (model %s)" %
           (args.host, args.port, get_model()))

@@ -201,6 +201,13 @@ def _wait_then(server, voice, glib, fn):
     if server.start():
         threading.Thread(target=voice.run, daemon=True).start()
         glib.idle_add(fn)
+    def _watch():
+        while True:
+            time.sleep(6)
+            if server.proc and server.proc.poll() is not None:
+                if server.start():
+                    glib.idle_add(fn)
+    threading.Thread(target=_watch, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------

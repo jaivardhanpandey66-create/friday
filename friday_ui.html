@@ -130,6 +130,9 @@
   .btn:hover{border-color:var(--cyan);box-shadow:0 0 14px rgba(159,184,255,.35);color:var(--white)}
   .btn:disabled{opacity:.35;cursor:default}
   .micbtn{border-radius:50%;width:52px;height:52px;font-size:18px;flex:none}
+  .stopbtn{border-radius:50%;width:52px;height:52px;font-size:16px;flex:none;border-color:var(--magenta);color:var(--magenta)}
+  .stopbtn:hover{box-shadow:0 0 14px rgba(198,106,224,.7);color:#fff}
+  .hide{display:none !important}
   .micbtn.live{border-color:var(--magenta);color:var(--magenta);box-shadow:0 0 18px rgba(198,106,224,.7);animation:blink 1s infinite}
   .voiceReadout{font-size:9px;letter-spacing:3px;color:var(--lilac);text-transform:uppercase;min-width:170px}
 
@@ -160,6 +163,7 @@
       <span class="badge" id="badge-mem" data-ok="0">MEM <em>OFF</em></span>
       <span class="badge" id="badge-tel" data-ok="0">TEL <em>OFF</em></span>
       <span id="voiceReadout" class="voiceReadout">VOICE: WAKE ARMING…</span>
+      <span>MODEL <select id="model-sel"><option>…</option></select></span>
       <span id="clock">--:--:--</span>
     </div>
   </header>
@@ -216,8 +220,9 @@
 
       <div class="compose">
         <input id="input" placeholder="command FRIDAY…" autocomplete="off">
-        <button class="btn" id="send">▶ send</button>
         <button class="btn micbtn" id="mic" title="Push to talk (voice in)">◉</button>
+        <button class="btn stopbtn hide" id="stop" title="Stop FRIDAY's reply">■ stop</button>
+        <button class="btn" id="send">▶ send</button>
       </div>
     </section>
 
@@ -273,6 +278,26 @@ const feed=document.getElementById('feed'),stepsEl=document.getElementById('step
 const input=document.getElementById('input'),send=document.getElementById('send');
 let session='friday',busy=false,curBot=null,stepN=0;
 
+/* ---------------- model picker ---------------- */
+const modelSel=document.getElementById('model-sel');
+(async function loadModels(){
+  try{
+    const data=await (await fetch('/api/models')).json();
+    const saved=localStorage.getItem('friday_model');
+    const list=data.models||[];
+    modelSel.innerHTML='';
+    modelSel.add(new Option('(default)',''));
+    (list.includes(saved)?[saved,...list.filter(m=>m!==saved)]:list)
+      .forEach(m=>modelSel.add(new Option(m,m)));
+    if(saved&&list.includes(saved))modelSel.value=saved;
+  }catch(e){
+    modelSel.innerHTML='<option value="">(default)</option>';
+  }
+})();
+modelSel.addEventListener('change',()=>{
+  localStorage.setItem('friday_model',modelSel.value||'');
+});
+
 function addMsg(kind,text){
   const m=document.createElement('div');m.className='msg '+kind;
   if(text)m.textContent=text;
@@ -303,10 +328,19 @@ function handle(ev){
     curBot.textContent='⚠ '+ev.error;
   }
 }
+let pendingMsg='';
+let abortCtrl=null;
+const stopBtn=document.getElementById('stop');
+function setBusy(b){
+  busy=b;
+  send.disabled=b;
+  stopBtn.classList.toggle('hide',!b);
+}
 async function chatWith(txt,auto){
   const msg=(txt??input.value).trim();
-  if(!msg||busy)return;
-  busy=true;send.disabled=true;
+  if(!msg)return;
+  if(busy){pendingMsg=msg;if(!auto)input.value='';return;}
+  setBusy(true);
   document.getElementById('coreState').textContent='THINKING';
   addMsg('user',msg);
   if(!auto)input.value='';
@@ -314,9 +348,11 @@ async function chatWith(txt,auto){
   const care=document.createElement('span');care.className='caret';care.textContent='▍';
   curBot.appendChild(care);
   try{
+    abortCtrl=new AbortController();
     const res=await fetch('/api/chat?stream=true',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:msg,session})
+      body:JSON.stringify({message:msg,session,model:modelSel.value}),
+      signal:abortCtrl.signal
     });
     if(!res.ok){const d=await res.json().catch(()=>({}));throw new Error(d.error||res.status);}
     const reader=res.body.getReader();const dec=new TextDecoder();let buf='';
@@ -331,17 +367,38 @@ async function chatWith(txt,auto){
           try{handle(JSON.parse(dl.slice(5).trim()));}catch(e){}
         }
       }
-      if(done)break;
+      if(done){
+        if(buf.trim()){
+          const dl=buf.split('\n').find(l=>l.startsWith('data:'));
+          try{
+            const d=JSON.parse(dl?dl.slice(5).trim():buf);
+            if(d&&d.error!==undefined)handle({type:'error',error:d.error});
+            else if(d&&d.answer!==undefined)handle({type:'done',answer:d.answer,steps:d.steps||[]});
+          }catch(e){if(buf.trim())curBot.textContent='⚠ '+buf.trim().slice(0,200);}
+        }
+        break;
+      }
     }
   }catch(err){
     curBot.classList.remove('typing');
-    curBot.innerHTML='';curBot.textContent='⚠ '+err;
+    if(err&&err.name==='AbortError'){
+      curBot.classList.remove('typing');
+      setBusy(false);
+    }else{
+      curBot.innerHTML='';curBot.textContent='⚠ '+err;
+    }
   }finally{
-    busy=false;send.disabled=false;
+    busy=false;send.disabled=false;stopBtn.classList.add('hide');
     document.getElementById('coreState').textContent='ONLINE';
     input.focus();
+    if(pendingMsg){const n=pendingMsg;pendingMsg='';chatWith(n,false);}
   }
 }
+stopBtn.addEventListener('click',()=>{
+  if(abortCtrl){abortCtrl.abort();curBot.classList.remove('typing');}
+  setBusy(false);pendingMsg='';
+  document.getElementById('coreState').textContent='ONLINE';
+});
 send.addEventListener('click',()=>chatWith(input.value,false));
 input.addEventListener('keydown',e=>{if(e.key==='Enter')chatWith(input.value,false);});
 
@@ -384,23 +441,30 @@ function _chip(t){
 }
 
 /* wake/ingest polling — auto-submits wake-word commands */
-let knownId=0,lastPoll=0;
+let knownId=0,lastPoll=0,prevWake='';
 async function pollVoice(){
   try{
     const r=await fetch('/api/vstate');const v=await r.json();
     setBadge('badge-mem',v.cortex);setBadge('badge-tel',v.stark);
     const wr=document.getElementById('voiceReadout');
-    if(v.wake==='attentive')wr.textContent='VOICE: ATTENTIVE ▍';
-    else if(v.wake==='listening')wr.textContent='VOICE: WAKE ARMED';
-    else wr.textContent='VOICE: OFF';
+    if(v.wake==='attentive'){
+      wr.textContent='VOICE: ATTENTIVE ▍';
+      if(prevWake!=='attentive')_chip('FRIDAY READY — go ahead');
+    }else if(v.wake==='listening')wr.textContent='VOICE: WAKE ARMED';
+    else if(v.wake==='off')wr.textContent='VOICE: OFF';
+    prevWake=v.wake;
     document.getElementById('wakeL').textContent=
       v.wake==='attentive'?'HEARD':'ARMED';
     if(v.last_id!==knownId&&v.last){
       knownId=v.last_id;
-      if(Date.now()-lastPoll>1500){lastPoll=Date.now();chatWith(v.last,true);}
+      pendingVoice=v.last;
     }
   }catch(e){}
+  if(pendingVoice&&!busy){
+    const t=pendingVoice;pendingVoice='';chatWith(t,true);
+  }
 }
+let pendingVoice='';
 function setBadge(id,on){
   const el=document.getElementById(id);if(!el)return;
   el.dataset.ok=on?'1':'0';
