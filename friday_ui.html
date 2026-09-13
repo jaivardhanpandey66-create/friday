@@ -251,7 +251,7 @@ const bootLines=[
   "FRIDAY OS  v4.2.1",
   "THREAD 07  ██  MODULES LOADING…",
   "  [ OK ]  neural-core       62 MB",
-  "  [ OK ]  voice engine (VOSK)  OFFLINE",
+  "  [ OK ]  voice engine (VOSK)  OFFLINE PIPELINE",
   "  [ OK ]  memory link        CORTEX",
   "  [ OK ]  telemetry          STARK",
   "  [ OK ]  actuator drivers   (pulse/x11)",
@@ -345,10 +345,9 @@ async function chatWith(txt,auto){
 send.addEventListener('click',()=>chatWith(input.value,false));
 input.addEventListener('keydown',e=>{if(e.key==='Enter')chatWith(input.value,false);});
 
-/* ---------------- voice: push-to-talk + wake state ---------------- */
+/* ---------------- voice: push-to-talk via server dictation (Vosk) ---------------- */
 const mic=document.getElementById('mic');
-let rec=null,holding=false;
-const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+let holding=false;
 async function holdMic(on){
   holding=on;
   try{
@@ -356,18 +355,25 @@ async function holdMic(on){
       body:JSON.stringify({hold:on})});
   }catch(e){}
 }
-function startMic(){
-  if(!SR){_chip('MIC unsupported — use the wake word or type.');return;}
+async function startMic(){
   if(busy)return;
-  _chip('LISTENING…');
-  holdMic(true);
-  if(rec){try{rec.stop();}catch(e){}}
-  rec=new SR();rec.lang='en-US';rec.interimResults=false;rec.continuous=false;
-  mic.classList.add('live');
-  rec.onresult=e=>{const t=e.results[0][0].transcript||'';_chip(t);holdMic(false);chatWith(t,true);};
-  rec.onend=()=>{holdMic(false);mic.classList.remove('live');};
-  rec.onerror=()=>{holdMic(false);mic.classList.remove('live');};
-  try{rec.start();}catch(e){}
+  _chip('LISTENING…');mic.classList.add('live');
+  await holdMic(true);
+  try{
+    const r=await fetch('/api/dictate?timeout=6');
+    const d=await r.json();
+    const t=(d&&d.text||'').trim();
+    _chip(t||'nothing heard');
+    if(t)chatWith(t,true);
+  }catch(e){
+    _chip('mic failed');
+  }finally{
+    mic.classList.remove('live');
+    await holdMic(false);
+    _chip('');setTimeout(()=>{
+      const c=document.getElementById('voiceChip');c.classList.remove('on');
+    },1800);
+  }
 }
 mic.addEventListener('click',startMic);
 

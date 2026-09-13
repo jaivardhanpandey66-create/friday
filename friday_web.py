@@ -671,6 +671,60 @@ def _set_last(text):
 # TTS (server-side, pyttsx3)
 _TTS_LOCK = threading.Lock()
 
+_VOSK_MODEL = {"m": None}          # lazy vosk model cache for dictation
+_DICTATE_LOCK = threading.Lock()
+
+
+def _vosk():
+    """Lazy-load the Vosk model used by the push-to-talk + wake engines."""
+    if _VOSK_MODEL["m"] is None:
+        import vosk
+        _VOSK_MODEL["m"] = vosk.Model(os.path.join(DATA_DIR, "model"))
+    return _VOSK_MODEL["m"]
+
+
+def dictate(seconds=6.0, silence_gap=1.5):
+    """Record the mic via arecord, transcribe with Vosk, return text."""
+    import json as _json
+    with _DICTATE_LOCK:
+        rec = None
+        p = None
+        try:
+            import subprocess
+            p = subprocess.Popen(
+                ["arecord", "-q", "-D", "default", "-f", "S16_LE",
+                 "-r", "16000", "-c", "1", "-t", "raw"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            krec = _vosk().KaldiRecognizer(_vosk(), 16000)
+            words = []
+            last = time.time()
+            end = time.time() + seconds
+            sp = time.time()
+            while time.time() < end:
+                raw = p.stdout.read(4096)
+                if not raw:
+                    time.sleep(0.05)
+                    continue
+                if krec.AcceptWaveform(raw):
+                    t = _json.loads(krec.Result()).get("text", "").strip()
+                    if t:
+                        words.append(t)
+                        last = time.time()
+                else:
+                    if _json.loads(krec.PartialResult()).get("partial", ""):
+                        last = time.time()
+                if time.time() - last > silence_gap and words:
+                    break
+            return " ".join(words)
+        except Exception as e:
+            return ""
+        finally:
+            if p:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
 
 def _tts(text):
     if not text:
@@ -752,6 +806,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"models": fetch_models(client)})
             except Exception as e:
                 return self._json({"models": [get_model()], "error": str(e)})
+        if path == "/api/dictate":
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                secs = float(q.get("timeout", ["6"])[0])
+            except ValueError:
+                secs = 6.0
+            text = dictate(seconds=secs)
+            return self._json({"text": text})
         if path == "/api/vstate":
             return self._json(dict(VOICE))
         if path == "/api/vwake":
