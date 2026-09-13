@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=FRIDAY
+Comment=Age-of-Ultron style PC command center
+Exec=python3 __DST__/friday_app.py
+Icon=__DST__/friday.svg
+Terminal=false
+Categories=Utility;System;
+StartupNotify=true
