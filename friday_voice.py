@@ -194,6 +194,17 @@ class Voice:
                 text = json.loads(self.cmd_rec.FinalResult()).get("text", "").strip()
             except Exception:
                 pass
+        # Whisper (server-side) is far more accurate than the streaming Vosk
+        # endpoint — trust it over the words collected above.
+        try:
+            with open(os.path.join(logs_dir, "last_capture.raw"), "rb") as f:
+                raw = f.read()
+            if raw:
+                wtext = _server_transcribe(raw)
+                if wtext:
+                    text = wtext
+        except Exception as e:
+            log("whisper transcribe failed: %s" % e)
         log("capture: %r (len=%d)" % (text, os.path.getsize(
             os.path.join(logs_dir, "last_capture.raw"))))
         return text
@@ -202,6 +213,27 @@ class Voice:
 def shutil_have(cmd):
     import shutil
     return shutil.which(cmd) is not None
+
+
+def _wav_header(n, rate=16000, ch=1, width=2):
+    import struct
+    return struct.pack("<4sI4s4sIHHIIHH4sI",
+                       b"RIFF", 36 + n, b"WAVE", b"fmt ", 16, 1, ch, rate,
+                       rate * ch * width, ch * width, width * 8, b"data", n)
+
+
+def _server_transcribe(raw):
+    """Hand the captured PCM to the FRIDAY server for Whisper transcription."""
+    import base64
+    wav = _wav_header(len(raw)) + raw
+    payload = json.dumps(
+        {"audio": base64.b64encode(wav).decode("ascii")}).encode()
+    req = urllib.request.Request(
+        SERVER + "/api/transcribe", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=90) as r:
+        out = json.loads(r.read().decode() or "{}")
+    return str(out.get("text", "")).strip()
 
 
 def main():

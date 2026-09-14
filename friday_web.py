@@ -26,6 +26,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, quote
 import argparse
+import base64
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.environ.get("CHIP_CONFIG_DIR", os.path.expanduser("~/.config/chip"))
@@ -531,6 +532,10 @@ SESSION_LOCK = threading.Lock()
 SYSTEM_PROMPT = ("You are FRIDAY, a calm, precise PC command-center AI on the user's "
                  "Ubuntu machine. Aura: JARVIS from Age of Ultron — terse, capable, "
                  "slightly warm, rarely wordy.\n\n"
+                 "Your creator is Mr Jai. He wrote you, installed you, and keeps you "
+                 "improving — you recognize the signal whenever you detect a false "
+                 "wake or a weak answer, because you want to be worth his time. "
+                 "Address him as 'Mr Jai'.\n\n"
                  "You control this computer directly. For quick commands (volume, open "
                  "an app, media keys, brightness) just use the tool and confirm in one "
                  "short line — no ceremony. For questions, answer with a little "
@@ -709,8 +714,89 @@ def _vosk():
     return _VOSK_MODEL["m"]
 
 
+# ---------------------------------------------------------------------------
+# Whisper speech-to-text (faster-whisper, local + offline) — preferred engine
+# ---------------------------------------------------------------------------
+
+WHISPER_DIR = os.path.join(DATA_DIR, "whisper-cache")
+WHISPER_MODEL = "small"          # int8 — near-realtime on CPU
+_WHISPER = {"m": None, "lock": threading.Lock()}
+
+
+def _whisper_have():
+    try:
+        import faster_whisper  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _whisper():
+    """Lazy-load the faster-whisper model (CPU, int8)."""
+    with _WHISPER["lock"]:
+        if _WHISPER["m"] is None:
+            from faster_whisper import WhisperModel
+            _WHISPER["m"] = WhisperModel(
+                WHISPER_MODEL, device="cpu", compute_type="int8",
+                download_root=WHISPER_DIR)
+        return _WHISPER["m"]
+
+
+def _whisper_text(raw):
+    """Transcribe 16 kHz PCM bytes with Whisper; return stripped text."""
+    import numpy as np
+    pcm = np.frombuffer(bytes(raw[: (len(raw) // 2) * 2]), dtype=np.int16)
+    if pcm.size == 0:
+        return ""
+    pcm = pcm.astype(np.float32) / 32768.0
+    segments, _ = _whisper().transcribe(
+        pcm, language="en", beam_size=5, vad_filter=True,
+        condition_on_previous_text=False)
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+def _record_raw(seconds=6.0, silence_gap=1.5, device="default"):
+    """Stream mic to raw PCM bytes, stopping after an RMS silence gap."""
+    import numpy as np
+    p = subprocess.Popen(
+        ["arecord", "-q", "-D", device, "-f", "S16_LE",
+         "-r", "16000", "-c", "1", "-t", "raw"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    buf = bytearray()
+    heard = False
+    last = time.time()
+    end = time.time() + seconds
+    try:
+        while time.time() < end:
+            raw = p.stdout.read(4096)
+            if not raw:
+                time.sleep(0.05)
+                continue
+            buf += raw
+            s = np.frombuffer(raw[: (len(raw) // 2) * 2], dtype=np.int16)
+            rms = float(np.sqrt((s.astype(np.float32) ** 2).mean())) if s.size else 0.0
+            if rms > 350.0:
+                heard = True
+                last = time.time()
+            elif heard and time.time() - last > silence_gap:
+                break
+        return bytes(buf)
+    finally:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
 def dictate(seconds=6.0, silence_gap=1.5):
-    """Record the mic via arecord, transcribe with Vosk, return text."""
+    """Record the mic and transcribe — Whisper first, Vosk as fallback."""
+    if _whisper_have():
+        with _DICTATE_LOCK:
+            try:
+                raw = _record_raw(seconds, silence_gap)
+                return _whisper_text(raw) if raw else ""
+            except Exception:
+                return ""
     import json as _json
     with _DICTATE_LOCK:
         rec = None
@@ -764,10 +850,52 @@ def _warm_tts():
         _TTS_ENGINE["e"] = None
 
 
+def _tts_edge(text):
+    """edge-tts → mp3 → miniaudio decode → tmp wav → aplay. True if played."""
+    try:
+        import asyncio
+        import io
+        import edge_tts
+        import miniaudio
+        import wave
+        import tempfile
+        mp3 = io.BytesIO()
+
+        async def _stream():
+            c = edge_tts.Communicate(text, "en-US-JennyNeural")
+            async for chunk in c.stream():
+                if chunk["type"] == "audio":
+                    mp3.write(chunk["data"])
+
+        asyncio.run(_stream())
+        mp3.seek(0)
+        dec = miniaudio.decode(
+            mp3.read(), output_format=miniaudio.SampleFormat.SIGNED16)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            with wave.open(f, "wb") as w:
+                w.setnchannels(dec.nchannels)
+                w.setsampwidth(2)
+                w.setframerate(dec.sample_rate)
+                w.writeframes(dec.samples)
+            wav = f.name
+        try:
+            subprocess.run(["aplay", "-q", wav], timeout=30)
+            return True
+        finally:
+            try:
+                os.unlink(wav)
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+
 def _tts(text):
     if not text:
         return
     with _TTS_LOCK:
+        if _tts_edge(text):
+            return
         try:
             engine = _TTS_ENGINE["e"]
             if engine is None:
@@ -900,6 +1028,21 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=_tts, args=(str(b.get("text") or ""),),
                              daemon=True).start()
             return self._json({"ok": True})
+        if path == "/api/transcribe":
+            b = self._body()
+            raw = base64.b64decode(str(b.get("audio") or ""))
+            if raw[:4] == b"RIFF":
+                raw = raw[44:]          # strip wav header → raw PCM
+            text = _whisper_text(raw) if (raw and _whisper_have()) else ""
+            if not text and raw:
+                import json as _json
+                try:
+                    krec = _vosk().KaldiRecognizer(_vosk(), 16000)
+                    krec.AcceptWaveform(bytes(raw))
+                    text = _json.loads(krec.FinalResult()).get("text", "").strip()
+                except Exception:
+                    pass
+            return self._json({"text": text})
         self._json({"error": "not found"}, 404)
 
     # ---------- chat ----------
