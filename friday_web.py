@@ -61,13 +61,37 @@ def get_api_key():
     return ""
 
 
+GEM_KEY_FILE = os.path.expanduser("~/.config/gemini/key")
+GEM_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
+GEM_MODELS = ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
+
+
+def get_gemini_key():
+    k = os.environ.get("GEMINI_API_KEY")
+    if k:
+        return k.strip()
+    try:
+        with open(GEM_KEY_FILE) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def on_gemini():
+    return bool(get_gemini_key())
+
+
 def get_model():
+    if on_gemini():
+        return GEM_MODELS[0]
     return os.environ.get("FRIDAY_MODEL", MODEL)
 
 
 def make_client():
     try:
         from openai import OpenAI
+        if on_gemini():
+            return OpenAI(base_url=GEM_BASE, api_key=get_gemini_key(), timeout=180)
         return OpenAI(base_url=BASE_URL, api_key=get_api_key(), timeout=180)
     except Exception as e:
         raise RuntimeError("openai client unavailable: %s" % e)
@@ -818,6 +842,8 @@ class Handler(BaseHTTPRequestHandler):
                 "tools": len(TOOLS), "sessions": len(SESSIONS),
             })
         if path == "/api/models":
+            if on_gemini():
+                return self._json({"models": GEM_MODELS})
             try:
                 client = make_client()
                 return self._json({"models": fetch_models(client)})
@@ -951,8 +977,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=PORT)
     args = ap.parse_args()
-    if not get_api_key():
-        print("FRIDAY: no API key found (set OPENROUTER_API_KEY or ~/.config/chip/key).")
+    if not (get_api_key() or get_gemini_key()):
+        print("FRIDAY: no API key found (set OPENROUTER_API_KEY / GEMINI_API_KEY or config files).")
         sys.exit(1)
     threading.Thread(target=_warm_tts, daemon=True).start()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
